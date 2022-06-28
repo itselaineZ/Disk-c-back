@@ -29,7 +29,8 @@ Server::~Server()
 }
 
 void Server::init(int port, string user, string passWord, string dbName,
-    int log_write, int sql_num, int close_log, int actormodel, int thread_num)
+    int log_write, int sql_num, int close_log, int actormodel, 
+    int thread_num, int file_thread_num)
 {
     m_port = port;
     m_user = user;
@@ -37,6 +38,7 @@ void Server::init(int port, string user, string passWord, string dbName,
     m_databaseName = dbName;
     m_sql_num = sql_num;
     m_thread_num = thread_num;
+    m_file_thread_num = file_thread_num;
     m_log_write = log_write;
     m_close_log = close_log;
     m_actormodel = actormodel;
@@ -57,17 +59,28 @@ void Server::sql_pool()
 {
     //初始化数据库连接池
     m_connPool = connection_pool::GetInstance();
-    printf("aaaa\n");
     m_connPool->init("localhost", m_user, m_passWord, m_databaseName, 3306, m_sql_num, m_close_log);
-    printf("bbbb\n");
     //初始化数据库读取表
     users->initmysql_result(m_connPool);
 }
 
 void Server::thread_pool()
 {
-    //线程池
+    //处理http请求的线程池
     m_pool = new threadpool<http_conn>(m_actormodel, m_connPool, m_thread_num);
+}
+
+void Server::file_pool()
+{
+    //用来处理文件写入数据库的线程池
+    m_fpool = new threadpool<file_mysql>(m_actormodel, m_connPool, m_file_thread_num);
+}
+
+void Server::task_pool()
+{
+    //上传池
+    m_taskpool = TASKPOOL::GetInstance();
+    users->init_taskpool(m_taskpool);
 }
 
 void Server::eventListen()
@@ -116,7 +129,7 @@ void Server::eventListen()
     ret = socketpair(PF_UNIX, SOCK_STREAM, 0, m_pipefd);
     assert(ret != -1);
     utils.setnonblocking(m_pipefd[1]);
-    utils.addfd(m_epollfd, m_pipefd[0], false);//0号添加到epoll
+    utils.addfd(m_epollfd, m_pipefd[0], false); // 0号添加到epoll
 
     //避免服务器send消息给一个已经关闭的socket后收到sigpipe而被系统杀死
     utils.addsig(SIGPIPE, SIG_IGN);
@@ -124,7 +137,6 @@ void Server::eventListen()
     utils.addsig(SIGTERM, utils.sig_handler, false); //软终止进程
 
     alarm(TIMESLOT);
-
 }
 
 void Server::eventLoop()
@@ -147,11 +159,11 @@ void Server::eventLoop()
                 bool flag = dealclinetdata();
                 if (false == flag)
                     continue;
-            } else if (events[i].events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)) {
-                //服务器端关闭连接，移除对应的定时器
-                util_timer* timer = users_timer[sockfd].timer;
-                deal_timer(timer, sockfd);
-            }
+            } //else if (events[i].events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)) {
+            //     //服务器端关闭连接，移除对应的定时器
+            //     util_timer* timer = users_timer[sockfd].timer;
+            //     deal_timer(timer, sockfd);
+            // }
             //处理信号（另一个进程发来的信息）
             else if ((sockfd == m_pipefd[0]) && (events[i].events & EPOLLIN)) {
                 bool flag = dealwithsignal(timeout, stop_server);
@@ -177,17 +189,18 @@ void Server::eventLoop()
 
 void Server::timer(int connfd, struct sockaddr_in client_address)
 {
-    users[connfd].init(connfd, client_address, m_root, m_close_log, m_user, m_passWord, m_databaseName);
+    users[connfd].init(connfd, client_address, m_root, m_close_log, m_user, m_passWord, m_databaseName, m_taskpool);
 
     //初始化client_data数据
     //创建定时器，设置回调函数和超时时间，绑定用户数据，将定时器添加到链表中
     users_timer[connfd].address = client_address;
     users_timer[connfd].sockfd = connfd;
+    //users_timer[connfd].p_user = users + connfd;
     util_timer* timer = new util_timer;
     timer->user_data = &users_timer[connfd];
-    timer->cb_func = cb_func;//删除user的函数
+    timer->cb_func = cb_func; //删除user的函数
     time_t cur = time(NULL);
-    timer->expire = cur + 3 * TIMESLOT;//新user延后3个时间结点
+    timer->expire = cur + 3 * TIMESLOT; //新user延后3个时间结点
     users_timer[connfd].timer = timer;
     utils.m_timer_lst.add_timer(timer);
 }
@@ -205,10 +218,11 @@ void Server::adjust_timer(util_timer* timer)
 
 void Server::deal_timer(util_timer* timer, int sockfd)
 {
-    users[sockfd].clear_auth();//清除auth
-    timer->cb_func(&users_timer[sockfd]);//删除该用户的epoll等
+    LOG_INFO("in deal_timer\n");
+    users[sockfd].close_conn(); // 关闭该连接的清除工作
+    timer->cb_func(&users_timer[sockfd]); //删除该用户的epoll等
     if (timer) {
-        utils.m_timer_lst.del_timer(timer);//删除定时器
+        utils.m_timer_lst.del_timer(timer); //删除定时器
     }
 
     LOG_INFO("close fd %d", users_timer[sockfd].sockfd);

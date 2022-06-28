@@ -1,6 +1,6 @@
 #include "config.h"
 
-const int conf_num = 9;
+const int conf_num = 10;
 const char* conf_item[][2] = {
     { "port", "80" }, 
     { "LOGWrite", "0" },
@@ -11,6 +11,7 @@ const char* conf_item[][2] = {
     { "databasename", "disk" },
     { "actormodel", "0" },
     { "threadnum", "8" },
+    { "filethreadnum", "4" },
     { NULL, NULL }
 };
 char conf_value[conf_num][ITEM_LENGTH];
@@ -84,4 +85,5 @@ Config::Config(const char* conffile)
     this->databasename = string(conf_value[6]);
     this->actormodel = atoi(conf_value[7]);
     this->thread_num = atoi(conf_value[8]);
+    this->file_thread_num = atoi(conf_value[9]);
 }

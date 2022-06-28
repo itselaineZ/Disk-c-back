@@ -197,6 +197,7 @@ int Utils::u_epollfd = 0;
 class Utils;
 void cb_func(client_data* user_data)
 {
+    //user_data->p_user->close_conn();
     epoll_ctl(Utils::u_epollfd, EPOLL_CTL_DEL, user_data->sockfd, 0);
     assert(user_data);
     close(user_data->sockfd);

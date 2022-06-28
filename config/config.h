@@ -17,7 +17,7 @@ public:
     Config(const char* conffile);
     ~Config() {};
 
-    int port, LOGWrite, sql_num, close_log, actormodel, thread_num;
+    int port, LOGWrite, sql_num, close_log, actormodel, thread_num, file_thread_num;
     string user;
     string passwd;
     string databasename;
