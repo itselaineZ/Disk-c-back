@@ -17,20 +17,17 @@ public:
     int GetSliceSize();
     int GetRecvSize(string task);
     int GetAllSize(string task);
-    bool FindSock(int sock, string task);
     string GetTaskType(string task);
     int GetTaskSize(string task);
-    void RemoveSock(string task, int sock);
-    bool RecoverSlice(string task, int slice);
+    bool FindSlice(string task, int slice);
 
 private:
     TASKPOOL();
     ~TASKPOOL();
 
-    locker lck_asgn, lck_rcv, lck_sock;
-    map<string, taskque*>* m_assign;
-    map<string, taskque*>* m_rec;
-    map<string, cliset*>* m_sockpool;
+    locker lck;
+    map<string, taskque*>* m_q;
+    //map<string, cliset*>* m_sockpool;
 };
 
 #endif

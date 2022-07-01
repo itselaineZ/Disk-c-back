@@ -19,6 +19,44 @@ locker m_lock;
 map<string, string> users;
 map<int, string> authlist;
 
+int GbkToUtf8(char* str_str, size_t src_len, char* dst_str, size_t dst_len)
+{
+    iconv_t cd;
+    char** pin = &str_str;
+    char** pout = &dst_str;
+
+    cd = iconv_open("utf8", "gbk");
+    if (cd == 0)
+        return -1;
+    memset(dst_str, 0, dst_len);
+    int ori_len = dst_len;
+    if (iconv(cd, pin, &src_len, pout, &dst_len) == -1)
+        return -1;
+    iconv_close(cd);
+    *pout = 0;
+
+    return ori_len - dst_len;
+}
+
+int Utf8ToGbk(char* src_str, size_t src_len, char* dst_str, size_t dst_len)
+{
+    iconv_t cd;
+    char** pin = &src_str;
+    char** pout = &dst_str;
+
+    cd = iconv_open("gbk", "utf8");
+    if (cd == 0)
+        return -1;
+    memset(dst_str, 0, dst_len);
+    int dst_ori_len = dst_len;
+    if (iconv(cd, pin, &src_len, pout, &dst_len) == -1)
+        return -1;
+    iconv_close(cd);
+    *pout = 0;
+
+    return dst_ori_len - dst_len;
+}
+
 void http_conn::initmysql_result(connection_pool* connPool)
 {
     //先从连接池中取一个连接
@@ -67,7 +105,8 @@ void addfd(int epollfd, int fd, bool one_shot)
     epoll_event event;
     event.data.fd = fd;
 
-    event.events = EPOLLIN | EPOLLRDHUP;
+    // event.events = EPOLLIN | EPOLLET | EPOLLRDHUP;
+    event.events = EPOLLIN | EPOLLET;
 
     if (one_shot)
         event.events |= EPOLLONESHOT;
@@ -87,7 +126,9 @@ void modfd(int epollfd, int fd, int ev)
 {
     epoll_event event;
     event.data.fd = fd;
-    event.events = ev | EPOLLONESHOT | EPOLLRDHUP;
+    event.events = ev | EPOLLET | EPOLLONESHOT;
+    // event.events = ev | EPOLLET | EPOLLONESHOT | EPOLLRDHUP;
+    //  event.events = ev | EPOLLRDHUP;
 
     epoll_ctl(epollfd, EPOLL_CTL_MOD, fd, &event);
 }
@@ -109,13 +150,11 @@ int http_conn::m_epollfd = -1;
 //关闭连接，关闭一个连接，客户总量减一
 void http_conn::close_conn(bool real_close)
 {
+    LOG_INFO("free %d size to %d", READ_BUFFER_SIZE, m_sockfd);
+    free(m_read_buf);
     if (real_close && (m_sockfd != -1)) {
         LOG_INFO("clear client(%d)", m_sockfd);
-        //clear_auth();
-        if (m_upload_file) { // 是一个上传状态的client，离开时需要从队列中移除
-            m_tp->RemoveSock(m_upload_file, m_sockfd);
-            m_tp->RecoverSlice(m_upload_file, m_slice_assign); // 连接到底会关闭吗？？？
-        }
+        // clear_auth();
         removefd(m_epollfd, m_sockfd);
         m_sockfd = -1;
         m_user_count--;
@@ -154,6 +193,9 @@ void http_conn::init(int sockfd, const sockaddr_in& addr, char* root,
 
     m_tp = tskpool;
 
+    LOG_INFO("alloc %d size to %d", READ_BUFFER_SIZE, m_sockfd);
+    m_read_buf = (char*)malloc(READ_BUFFER_SIZE * sizeof(char));
+
     init();
 }
 
@@ -161,6 +203,7 @@ void http_conn::init(int sockfd, const sockaddr_in& addr, char* root,
 // check_state默认为分析请求行状态
 void http_conn::init()
 {
+    m_inpool = false;
     mysql = NULL;
     bytes_to_send = 0;
     bytes_have_send = 0;
@@ -190,8 +233,9 @@ void http_conn::init()
     m_file_type = 0;
     m_file_size = -1;
     m_slice_assign = -1;
+    m_boundary = 0;
 
-    memset(m_read_buf, '\0', READ_BUFFER_SIZE);
+    // memset(m_read_buf, '\0', READ_BUFFER_SIZE);
     memset(m_write_buf, '\0', WRITE_BUFFER_SIZE);
     memset(m_real_file, '\0', FILENAME_LEN);
 }
@@ -222,9 +266,7 @@ http_conn::LINE_STATUS http_conn::parse_line()
                 return LINE_BAD;
             }
         } else { // content里不需要解析
-            if (temp != '\0') {
-                return LINE_OK;
-            }
+            return LINE_OK;
         }
     }
     return LINE_OPEN;
@@ -238,14 +280,26 @@ bool http_conn::read_once()
     }
     int bytes_read = 0;
 
-    bytes_read = recv(m_sockfd, m_read_buf + m_read_idx, READ_BUFFER_SIZE - m_read_idx, 0);
-    m_read_idx += bytes_read;
-
-    if (bytes_read <= 0) {
-        return false;
+    while (1) {
+        bytes_read = recv(m_sockfd, m_read_buf + m_read_idx, READ_BUFFER_SIZE - m_read_idx, 0);
+        LOG_INFO("bytes_read:%d", bytes_read);
+        // LOG_INFO("%s\n-----------",m_read_buf+m_read_idx);
+        if (bytes_read == 0)
+            return false;
+        else if (bytes_read < 0 && errno == EAGAIN) {
+            modfd(m_epollfd, m_sockfd, EPOLLIN);
+            return true;
+        }
+        // char* p = (char*)malloc(sizeof(char) * (bytes_read + 5));
+        // int rt = Utf8ToGbk(m_read_buf + m_read_idx, bytes_read, p, bytes_read);
+        // strcpy(m_read_buf + m_read_idx, p);
+        // if (rt != -1)
+        //     bytes_read = rt;
+        // LOG_INFO("%s", m_read_buf+m_read_idx);
+        m_read_idx += bytes_read;
+        LOG_INFO("m_read_idx:%d, bytes_read:%d", m_read_idx, bytes_read);
+        // modfd(m_epollfd, m_sockfd, EPOLLIN);
     }
-
-    return true;
 }
 
 //解析http请求行，获得请求方法，目标url及http版本号
@@ -327,7 +381,9 @@ http_conn::HTTP_CODE http_conn::parse_headers(char* text)
         m_content_type = text;
         int p = strspn(text, "; \t");
         text += p;
-        *text = '\0';
+        *text++ = '\0';
+        text = strpbrk(text, "=") + 1;
+        m_boundary = text;
     } else if (strncasecmp(text, "Upload_File:", 12) == 0) {
         text += 12;
         text += strspn(text, " \t");
@@ -341,14 +397,6 @@ http_conn::HTTP_CODE http_conn::parse_headers(char* text)
         } else
             m_slice_id = -1;
         // m_linger = 1;
-    } else if (strncasecmp(text, "User_name:", 10) == 0) {
-        text += 10;
-        text += strspn(text, " \t");
-        m_username = text;
-    } else if (strncasecmp(text, "Save_path:", 10) == 0) {
-        text += 10;
-        text += strspn(text, " \t");
-        m_savepath = text;
     } else if (strncasecmp(text, "File_type:", 10) == 0) {
         text += 10;
         text += strspn(text, " \t");
@@ -367,10 +415,20 @@ http_conn::HTTP_CODE http_conn::parse_headers(char* text)
 http_conn::HTTP_CODE http_conn::parse_content(char* text)
 {
     // printf("m_read_idx:%d,m_content_length:%d,m_checked_idx:%d\n", m_read_idx, m_content_length, m_checked_idx);
-    // printf("text:%s\n", text);
+    //   printf("text:%s\n", text);
     if (m_read_idx >= (m_content_length + m_checked_idx)) {
         text[m_content_length] = '\0';
         m_string = text;
+        // LOG_INFO("%s\n-------------", m_string);
+        // char* p = (char*)malloc(sizeof(char) * (m_content_length + 5));
+        // int rt = Utf8ToGbk(m_string, m_content_length, p, m_content_length);
+        // // LOG_INFO("rt=%d",rt);
+        // strcpy(m_string, p);
+        // free(p);
+        // if (rt != -1)
+        //     m_content_length = rt;
+        // m_string[m_content_length] = '\0';
+        // LOG_INFO("%s\n-------------", m_string);
         return GET_REQUEST;
     }
     return NO_REQUEST;
@@ -438,6 +496,11 @@ http_conn::HTTP_CODE http_conn::do_request()
             for (i = 9; m_string[i] != '&'; ++i)
                 name[i - 9] = m_string[i];
             name[i - 9] = '\0';
+            // int len1 = strlen(name), len2 = 300;
+            // char* pa = (char*)malloc(sizeof(char)*300);
+            // Utf8ToGbk(name, len1, pa, len2);
+            // strcpy(name, pa);
+            // free(pa);
 
             int j = 0;
             for (i = i + 10; m_string[i] != '\0' && m_string[i] != '\t' && m_string[i] != ' '; ++i, ++j)
@@ -446,7 +509,7 @@ http_conn::HTTP_CODE http_conn::do_request()
 
             if (!name[0] || !password[0]) {
                 LOG_ERROR("GET Name/password failed");
-                return INTERNAL_ERROR;
+                return BAD_REQUEST;
             }
             if (m_with_auth)
                 gen_auth();
@@ -457,44 +520,70 @@ http_conn::HTTP_CODE http_conn::do_request()
                 m_res_type = RES_MESSAGE;
                 return login_request(name, password);
             }
-        } else if (*(p + 1) == '2' || *(p + 1) == '8') {
+        } else if (*(p + 1) == '2' || *(p + 1) == '8' || *(p + 1) == 'a' || *(p + 1) == 'b') {
             // path=xx&username=xx
             char* pth = strstr(m_string, "path=");
+            if (!pth)
+                return BAD_REQUEST;
             pth += 5;
             char* name = pth;
-            name = strpbrk(pth, " \t,&");
+            name = strpbrk(pth, "&");
             *name++ = '\0';
             name += 9;
-            char* pa = strpbrk(name, " \t,\r\n");
-            if (pa)
+            m_string = name;
+            char* pa = strpbrk(name, " &\t,\r\n");
+            if (pa) {
                 *(pa) = '\0';
+                m_string = pa + 1;
+            }
+            // int len1 = strlen(name), len2 = 300;
+            // char* pa = (char*)malloc(sizeof(char)*300);
+            // Utf8ToGbk(name, len1, pa, len2);
+            // strcpy(name, pa);
+            // len1 = strlen(pth);
+
+            // free(pa);
             LOG_INFO("query: pth=%s, username=%s\n", pth, name);
+            m_username = name;
             if (*(p + 1) == '2') { // 查询文件
                 m_res_type = RES_FILE;
                 HTTP_CODE rt = getdir_request(name, pth);
                 if (rt == INTERNAL_ERROR)
                     return INTERNAL_ERROR;
-            } else { // 删除文件/文件夹
+            } else if (*(p + 1) == '8') { // 删除文件/文件夹
                 m_res_type = RES_MESSAGE;
                 return delfile_request(name, pth);
+            } else if (*(p + 1) == 'a') { // 'a' 下载单文件
+                // m_res_type按照函数内要求实现
+                m_savepath = pth;
+                HTTP_CODE rt = downloadsingle_request(name, pth);
+                if (rt == INTERNAL_ERROR)
+                    return INTERNAL_ERROR;
+                if (m_res_type == RES_MESSAGE)
+                    return rt;
+            } else { // 'b' 中途取消上传、下载
+                m_res_type = RES_MESSAGE;
+                return delbreakpoint_request(name, pth);
             }
         } else if (*(p + 1) == '3') { // 创建目录
             m_res_type = RES_MESSAGE;
             return mkdir_request();
-        } else if (*(p + 1) == '4' || *(p + 1) == 'd') { // 查询文件未完成状态
+        } else if (*(p + 1) == '4' || *(p + 1) == 'd') {
             // username=xx
             char* name = strstr(m_string, "username=");
+            if (!name)
+                return BAD_REQUEST;
             name += 9;
             char* pa = strpbrk(name, " \t\n\r");
             if (pa)
                 *pa = '\0';
             printf("name:%s\n", name);
-            if (*(p + 1) == '4') {
+            if (*(p + 1) == '4') { // 查询文件未完成状态
                 m_res_type = RES_FILE;
                 HTTP_CODE rt = getstate_request(name);
                 if (rt == INTERNAL_ERROR)
                     return INTERNAL_ERROR;
-            } else {
+            } else { // 查某个用户所有文件夹、文件
                 m_res_type = RES_FILE;
                 HTTP_CODE rt = getall_request(name);
                 if (rt == INTERNAL_ERROR)
@@ -503,13 +592,19 @@ http_conn::HTTP_CODE http_conn::do_request()
         } else if (*(p + 1) == '5' || *(p + 1) == '6' || *(p + 1) == '7') {
             // username=xx&oldpath=xx&newpath=xx
             char* name = strstr(m_string, "username=");
+            if (!name)
+                return BAD_REQUEST;
             name += 9;
             char* oldpath = name;
-            oldpath = strpbrk(oldpath, " &,\n\r");
+            oldpath = strpbrk(oldpath, "&");
+            if (!oldpath)
+                return BAD_REQUEST;
             *oldpath++ = '\0';
             oldpath += 8;
             char* newpath = oldpath;
-            newpath = strpbrk(newpath, " &,\n\r");
+            newpath = strpbrk(newpath, "&");
+            if (!newpath)
+                return BAD_REQUEST;
             *newpath++ = '\0';
             newpath += 8;
             char* pa = strpbrk(newpath, " \t\r\n");
@@ -549,12 +644,26 @@ http_conn::HTTP_CODE http_conn::do_request()
             // username=xx&filename=xx&filetype=xx&filesize=xx&filepath=xx
             m_res_type = RES_MESSAGE;
             return uploadsingle_request();
-        } else if (*(p + 1) == 'a') { // 单个文件下载
-
-        } else if (*(p + 1) == 'b') { // 文件夹上传
-
         } else if (*(p + 1) == 'c') { // 文件夹下载
-
+            // username=xx&dirpath=xx&needslice=hello/dirdone/0...
+            char* name = strstr(m_string, "username=");
+            if (!name)
+                return BAD_REQUEST;
+            name += 9;
+            char* dirpath = strpbrk(name, "&");
+            if (!dirpath)
+                return BAD_REQUEST;
+            *dirpath++ = '\0';
+            dirpath += 8;
+            char* pa = strpbrk(dirpath, " \t\n\r");
+            if (pa)
+                *pa = '\0';
+            // m_res_type由函数内决定
+            HTTP_CODE rt = downloaddir_request(name, dirpath);
+            if (rt == INTERNAL_ERROR)
+                return INTERNAL_ERROR;
+            if (m_res_type == RES_MESSAGE)
+                return FILE_REQUEST;
         } else {
             return BAD_REQUEST;
         }
@@ -574,7 +683,7 @@ http_conn::HTTP_CODE http_conn::do_request()
 
 http_conn::HTTP_CODE http_conn::register_request(const char* name, const char* password)
 {
-    char* sql_insert = (char*)malloc(sizeof(char) * 200);
+    char* sql_insert = (char*)malloc(sizeof(char) * SQL_CLAUS_LEN);
     //如果是注册，先检测数据库中是否有重名的
     //没有重名的，进行增加数据
     string md5key = ToKey(password);
@@ -630,7 +739,7 @@ http_conn::HTTP_CODE http_conn::register_request(const char* name, const char* p
         }
     } else {
         m_res = "1";
-        LOG_INFO(" Register Name Repeated, client(%s)\n", inet_ntoa(m_address.sin_addr));
+        LOG_INFO("Register Name Repeated, client(%s)\n", inet_ntoa(m_address.sin_addr));
     }
     free(sql_insert);
     return FILE_REQUEST;
@@ -652,15 +761,7 @@ http_conn::HTTP_CODE http_conn::login_request(const char* name, const char* pass
 
 http_conn::HTTP_CODE http_conn::getdir_request(const char* name, const char* pth)
 {
-    char* sql_insert = (char*)malloc(sizeof(char) * 200);
-
-    // if (authlist.find(m_sockfd) == authlist.end()) {
-    //     LOG_ERROR("NO Auth ERROR, client(%s)\n", inet_ntoa(m_address.sin_addr));
-    //     return INTERNAL_ERROR;
-    // } else {
-    // string auth = authlist[m_sockfd];
-    // if (strcmp(m_auth, auth.c_str()) == 0) {
-    // not '/username/[/]'
+    char* sql_insert = (char*)malloc(sizeof(char) * SQL_CLAUS_LEN);
     strcpy(sql_insert, "SELECT f_path, change_time, f_type, f_size FROM user_file WHERE u_name='");
     strcat(sql_insert, name);
     strcat(sql_insert, "' AND f_path REGEXP '");
@@ -677,15 +778,19 @@ http_conn::HTTP_CODE http_conn::getdir_request(const char* name, const char* pth
     MYSQL_RES* result = mysql_store_result(mysql);
     int num_fields = mysql_num_fields(result);
     MYSQL_FIELD* fields = mysql_fetch_fields(result);
+    printf("name:%s\n", name);
     strcpy(m_real_file, name);
     strcat(m_real_file, ".filelst");
     LOG_INFO("create file:%s\n", m_real_file);
 
     ofstream rowfs(m_real_file, ios::out);
     rowfs << "[";
-    while (MYSQL_ROW row = mysql_fetch_row(result)) {
-
-        rowfs << "{\"f_path\":\"" << row[0] << "\",";
+    char* p = (char*)malloc(sizeof(char) * 500);
+    MYSQL_ROW row;
+    while (row = mysql_fetch_row(result)) {
+        int len = strlen(row[0]);
+        int rt = GbkToUtf8(row[0], len, p, 100);
+        rowfs << "{\"f_path\":\"" << p << "\",";
         rowfs << "\"change_time\":\"" << row[1] << "\",";
         if (row[2])
             rowfs << "\"f_type\":\"" << row[2] << "\",";
@@ -696,13 +801,9 @@ http_conn::HTTP_CODE http_conn::getdir_request(const char* name, const char* pth
         else
             rowfs << "\"f_size\":\"null\"},\n";
     }
+    free(p);
     rowfs << "]";
     rowfs.close();
-    // } else {
-    //     LOG_INFO("Auth Failed, client(%s)\n", inet_ntoa(m_address.sin_addr));
-    //     return BAD_REQUEST;
-    // }
-    //}
     free(sql_insert);
     return FILE_REQUEST;
 }
@@ -710,17 +811,43 @@ http_conn::HTTP_CODE http_conn::getdir_request(const char* name, const char* pth
 http_conn::HTTP_CODE http_conn::mkdir_request()
 {
     // path=xx&username=xx
-    char* sql_insert = (char*)malloc(sizeof(char) * 200);
+    char* sql_insert = (char*)malloc(sizeof(char) * SQL_CLAUS_LEN);
     char* pth = strstr(m_string, "path=");
+    if (!pth)
+        return BAD_REQUEST;
     pth += 5;
     char* name = pth;
-    name = strpbrk(pth, " \t,&");
+    name = strpbrk(pth, "&");
+    if (!name)
+        return BAD_REQUEST;
     *name++ = '\0';
     name += 9;
     char* p = strpbrk(name, " \t,\r\n");
     if (p)
         *(p) = '\0';
     LOG_INFO("create: pth=%s, username=%s\n", pth, name);
+    strcpy(sql_insert, "SELECT f_path FROM user_file WHERE u_name='");
+    strcat(sql_insert, name);
+    strcat(sql_insert, "' AND f_path='");
+    strcat(sql_insert, pth);
+    strcat(sql_insert, "'");
+    LOG_INFO(sql_insert);
+    if (mysql_query(mysql, sql_insert)) {
+        LOG_ERROR("SELECT error:%s\n", mysql_error(mysql));
+        free(sql_insert);
+        return INTERNAL_ERROR;
+    }
+    MYSQL_RES* result = mysql_store_result(mysql);
+    int num_fields = mysql_num_fields(result);
+    MYSQL_FIELD* fields = mysql_fetch_fields(result);
+    MYSQL_ROW row = mysql_fetch_row(result);
+    if (row) {
+        m_res = "-2"; // 重复目录
+        free(sql_insert);
+        LOG_INFO("duplicate dir:%s", pth);
+        return FILE_REQUEST;
+    }
+
     strcpy(sql_insert, "INSERT INTO user_file(u_name, f_path, change_time, f_type) VALUES('");
     strcat(sql_insert, name);
     strcat(sql_insert, "', '");
@@ -754,8 +881,8 @@ http_conn::HTTP_CODE http_conn::mkdir_request()
 
 http_conn::HTTP_CODE http_conn::getstate_request(const char* name)
 {
-    char* sql_insert = (char*)malloc(sizeof(char) * 200);
-    strcpy(sql_insert, "SELECT f_path, f_size, f_type, breakpoint, op FROM file_breakpoint WHERE u_name='");
+    char* sql_insert = (char*)malloc(sizeof(char) * SQL_CLAUS_LEN);
+    strcpy(sql_insert, "SELECT f_path, f_size, f_type, breakpoint, op, f_name FROM file_breakpoint WHERE u_name='");
     strcat(sql_insert, name);
     strcat(sql_insert, "'");
     LOG_INFO(sql_insert);
@@ -774,14 +901,18 @@ http_conn::HTTP_CODE http_conn::getstate_request(const char* name)
 
     ofstream rowfs(m_real_file, ios::out);
     rowfs << "[";
+    char* p = (char*)malloc(sizeof(char) * 500);
     while (MYSQL_ROW row = mysql_fetch_row(result)) {
-
-        rowfs << "{'f_path':'" << row[0] << "',";
-        rowfs << "'f_size':'" << row[1] << "',";
-        rowfs << "'f_type':'" << row[2] << "',";
-        rowfs << "'breakpoint':'" << row[3] << "'},\n";
-        rowfs << "'op':'" << row[4] << "'},\n";
+        int len = strlen(row[0]);
+        GbkToUtf8(row[0], len, p, 500);
+        rowfs << "{\"f_path\":\"" << p << "\",";
+        rowfs << "\"f_size\":" << row[1] << ",";
+        rowfs << "\"f_type\":\"" << row[2] << "\",";
+        rowfs << "\"breakpoint\":" << row[3] << ",";
+        rowfs << "\"op\":\"" << row[4] << "\",";
+        rowfs << "\"f_name\":\"" << row[5] << "\"},\n";
     }
+    free(p);
     rowfs << "]";
     rowfs.close();
     free(sql_insert);
@@ -790,19 +921,59 @@ http_conn::HTTP_CODE http_conn::getstate_request(const char* name)
 
 http_conn::HTTP_CODE http_conn::changename_request(const char* name, const char* oldpath, const char* newpath)
 {
-    char* sql_insert = (char*)malloc(sizeof(char) * 200);
-    strcpy(sql_insert, "UPDATE user_file SET f_path='");
-    strcat(sql_insert, newpath);
-    strcat(sql_insert, "' WHERE u_name='");
-    strcat(sql_insert, name);
-    strcat(sql_insert, "' AND f_path='");
-    strcat(sql_insert, oldpath);
-    strcat(sql_insert, "'");
-    LOG_INFO(sql_insert);
+    char* sql_insert = (char*)malloc(sizeof(char) * SQL_CLAUS_LEN);
+    // strcpy(sql_insert, "UPDATE user_file SET f_path='");
+    // strcat(sql_insert, newpath);
+    // strcat(sql_insert, "' WHERE u_name='");
+    // strcat(sql_insert, name);
+    // strcat(sql_insert, "' AND f_path='");
+    // strcat(sql_insert, oldpath);
+    // strcat(sql_insert, "'");
+    // LOG_INFO(sql_insert);
 
-    m_lock.lock();
-    int res = mysql_query(mysql, sql_insert);
-    m_lock.unlock();
+    // m_lock.lock();
+    // int res = mysql_query(mysql, sql_insert);
+    // m_lock.unlock();
+
+    strcpy(sql_insert, "SELECT f_path FROM user_file WHERE u_name='");
+    strcat(sql_insert, name);
+    strcat(sql_insert, "' AND (f_path REGEXP '");
+    strcat(sql_insert, oldpath);
+    strcat(sql_insert, "/.*' OR f_path='");
+    strcat(sql_insert, oldpath);
+    strcat(sql_insert, "')");
+    LOG_INFO(sql_insert);
+    if (mysql_query(mysql, sql_insert)) {
+        LOG_ERROR("SELECT error:%s\n", mysql_error(mysql));
+        free(sql_insert);
+        return INTERNAL_ERROR;
+    }
+    MYSQL_RES* result = mysql_store_result(mysql);
+    int num_fields = mysql_num_fields(result);
+    MYSQL_FIELD* fields = mysql_fetch_fields(result);
+    int len = strlen(oldpath), res = 0;
+    while (MYSQL_ROW row = mysql_fetch_row(result)) {
+        strcpy(sql_insert, "UPDATE user_file SET f_path='");
+        if (strlen(row[0]) != len)
+            strcat(sql_insert, (std::string(newpath) + std::string(row[0]).substr(len)).c_str());
+        else
+            strcat(sql_insert, newpath);
+        strcat(sql_insert, "' WHERE u_name='");
+        strcat(sql_insert, name);
+        strcat(sql_insert, "' AND f_path='");
+        strcat(sql_insert, row[0]);
+        strcat(sql_insert, "'");
+        LOG_INFO(sql_insert);
+        m_lock.lock();
+        res = mysql_query(mysql, sql_insert);
+        m_lock.unlock();
+        if (res) {
+            m_res = "-1";
+            free(sql_insert);
+            LOG_ERROR("UPDATE user_file f_path ERROR, res = %d:%s\n", res, mysql_error(mysql));
+            return INTERNAL_ERROR;
+        }
+    }
 
     if (res) {
         m_res = "-1";
@@ -817,7 +988,7 @@ http_conn::HTTP_CODE http_conn::changename_request(const char* name, const char*
 
 http_conn::HTTP_CODE http_conn::copyfile_request(const char* name, const char* oldpath, const char* newpath)
 {
-    char* sql_insert = (char*)malloc(sizeof(char) * 200);
+    char* sql_insert = (char*)malloc(sizeof(char) * SQL_CLAUS_LEN);
     int len = strlen(oldpath);
     strcpy(sql_insert, "SELECT u_name,f_name,f_type,f_size,f_path,change_time FROM user_file WHERE u_name='");
     strcat(sql_insert, name);
@@ -887,7 +1058,7 @@ http_conn::HTTP_CODE http_conn::copyfile_request(const char* name, const char* o
 
 http_conn::HTTP_CODE http_conn::movefile_request(const char* name, const char* oldpath, const char* newpath)
 {
-    char* sql_insert = (char*)malloc(sizeof(char) * 200);
+    char* sql_insert = (char*)malloc(sizeof(char) * SQL_CLAUS_LEN);
     int len = strlen(oldpath);
     strcpy(sql_insert, "UPDATE user_file SET f_path=CONCAT('");
     strcat(sql_insert, newpath);
@@ -919,10 +1090,10 @@ http_conn::HTTP_CODE http_conn::movefile_request(const char* name, const char* o
 
 http_conn::HTTP_CODE http_conn::delfile_request(const char* name, const char* pth)
 {
-    char* sql_insert = (char*)malloc(sizeof(char) * 200);
+    char* sql_insert = (char*)malloc(sizeof(char) * SQL_CLAUS_LEN);
     strcpy(sql_insert, "SELECT f_name,f_type,f_size FROM user_file WHERE u_name='");
     strcat(sql_insert, name);
-    strcat(sql_insert, "' AND (f_path REGEXP '");
+    strcat(sql_insert, "' AND (f_path='");
     strcat(sql_insert, pth);
     strcat(sql_insert, "' OR f_path REGEXP '");
     strcat(sql_insert, pth);
@@ -939,7 +1110,7 @@ http_conn::HTTP_CODE http_conn::delfile_request(const char* name, const char* pt
 
     strcpy(sql_insert, "DELETE FROM user_file WHERE u_name='");
     strcat(sql_insert, name);
-    strcat(sql_insert, "' AND (f_path REGEXP '");
+    strcat(sql_insert, "' AND (f_path='");
     strcat(sql_insert, pth);
     strcat(sql_insert, "' OR f_path REGEXP '");
     strcat(sql_insert, pth);
@@ -965,15 +1136,15 @@ http_conn::HTTP_CODE http_conn::delfile_request(const char* name, const char* pt
             strcat(sql_insert, row[1]);
             strcat(sql_insert, "' AND fsize=");
             strcat(sql_insert, row[2]);
-            strcat(sql_insert, "'");
             LOG_INFO(sql_insert);
 
             m_lock.lock();
             res = mysql_query(mysql, sql_insert);
             m_lock.unlock();
-            if (!res) {
+            system(("rm -rf " + std::string(row[0])).c_str());
+            if (res) {
                 m_res = "-1";
-                LOG_ERROR("UPDATE user_file refer ERROR, res = %d:%s\n", res, mysql_error(mysql));
+                LOG_ERROR("UPDATE files refer ERROR, res = %d:%s\n", res, mysql_error(mysql));
                 free(sql_insert);
                 return INTERNAL_ERROR;
             }
@@ -999,51 +1170,40 @@ http_conn::HTTP_CODE http_conn::delfile_request(const char* name, const char* pt
 
 http_conn::HTTP_CODE http_conn::uploadsingle_request()
 {
+    char* p = strstr(m_string, "username=");
+    if (!p)
+        return BAD_REQUEST;
+    p += 9;
+    m_username = p;
+    p = strpbrk(p, "&");
+    if (!p)
+        return BAD_REQUEST;
+    *p++ = '\0';
+    p += 9;
+    m_savepath = p;
+    p = strpbrk(p, "\n\r");
+    *p = '\0';
+    m_string = p + 1;
     if (file_exist()) { // 是否数据库中已经有文件
-        printf("file exists.\n");
+        LOG_INFO("file exists.");
         m_res = "{\"already\":1, \"all\":1}";
-        HTTP_CODE rt = insertfile_mysql(false);
+        HTTP_CODE rt = insertfile_mysql(UPDATE_MYSQL);
         if (rt == INTERNAL_ERROR)
             return INTERNAL_ERROR;
         return userfile_mysql();
     } else {
         if (m_string[0] == 'u') { // 首次提交上传申请
-            printf("in upload\n");
             // upload
             LOG_INFO("upload REQUEST: username=%s,filemd5=%s,filetype=%s,filesize=%d,filepath=%s",
                 m_username, m_upload_file, m_file_type, m_file_size, m_savepath);
-            LOG_INFO("add task:%d\n", m_sockfd);
+            LOG_INFO("add task:%d", m_sockfd);
             m_tp->AddTask(m_upload_file, m_file_size, m_sockfd, m_file_type);
-            // HTTP_CODE rt = breakpoint_mysql(true);
-            // if (rt == INTERNAL_ERROR)
-            //     return INTERNAL_ERROR;
         } else if (m_string[0] == 'w') { // 无分配数据传输情况下的保持联系，同步进度
-            printf("in waiting\n");
-            // int already = m_tp->GetRecvSize(m_upload_file);
-            // int all = m_tp->GetAllSize(m_upload_file);
-            // if (already == -1 || all == -1) {
-            //     LOG_INFO("too late waiting: sockfd=%d", m_sockfd);
-            //     return BAD_REQUEST;
-            // }
-
-            // m_res = "{\"already\":" + std::to_string(already) + ", \"all\":" + std::to_string(all) + "}";
-
-            // if (already == all) {
-            //     HTTP_CODE rt = insertfile_mysql(m_file_type, m_file_size, false);
-            //     if (rt == INTERNAL_ERROR)
-            //         return INTERNAL_ERROR;
-            //     return userfile_mysql(m_file_type, m_file_size);
-            // } else
-            //     return FILE_REQUEST;
-            // HTTP_CODE rt = breakpoint_mysql(false);
-            // if (rt == INTERNAL_ERROR)
-            //     return INTERNAL_ERROR;
+            LOG_INFO("in waiting");
         } else { // multipart/form-data传输数据
-            LOG_INFO("to save:%d\n", m_sockfd);
-            if (!m_tp->FindSock(m_sockfd, m_upload_file)) {
-                LOG_INFO("too late upload: sockfd=%d", m_sockfd);
-                return BAD_REQUEST;
-            } else {
+            LOG_INFO("to save:%d", m_sockfd);
+            // 当前传上来的片还没有被存储过
+            if (!m_tp->FindSlice(m_upload_file, m_slice_id)) {
                 int sv_rt = save_file();
                 if (sv_rt == false)
                     return INTERNAL_ERROR;
@@ -1056,11 +1216,13 @@ http_conn::HTTP_CODE http_conn::uploadsingle_request()
                     LOG_ERROR("merge task[%s] failed", m_upload_file);
                     return INTERNAL_ERROR;
                 } else if (rc_rt == MERGE_SUCCESS) {
-                    m_res = "{\"already\":" + std::to_string(m_tp->GetRecvSize(m_upload_file))
-                        + ", \"all\":" + std::to_string(m_tp->GetAllSize(m_upload_file))
+                    int already = m_tp->GetRecvSize(m_upload_file);
+                    int all = m_tp->GetAllSize(m_upload_file);
+                    m_res = "{\"already\":" + std::to_string(already)
+                        + ", \"all\":" + std::to_string(all)
                         + "}";
-                    HTTP_CODE rt; // = breakpoint_mysql(false, );
-                    rt = insertfile_mysql(true);
+                    HTTP_CODE rt = breakpoint_mysql(DELETE_MYSQL, "up", 0);
+                    rt = insertfile_mysql(INSERT_MYSQL, all);
                     if (rt == INTERNAL_ERROR)
                         return INTERNAL_ERROR;
                     return userfile_mysql();
@@ -1068,42 +1230,61 @@ http_conn::HTTP_CODE http_conn::uploadsingle_request()
             }
         }
         int offset_begin = m_tp->GetSlice(m_upload_file);
+        int already = m_tp->GetRecvSize(m_upload_file);
+        int all = m_tp->GetAllSize(m_upload_file);
+        int slicesize = m_tp->GetSliceSize();
+        if (!all) {
+            HTTP_CODE rt = insertfile_mysql(INSERT_MYSQL, all);
+            if (rt == INTERNAL_ERROR)
+                return INTERNAL_ERROR;
+            return userfile_mysql();
+        }
+
+        HTTP_CODE rt;
+        if (m_string[0] == 'u')
+            rt = breakpoint_mysql(INSERT_MYSQL, "up", already * slicesize);
+        else
+            rt = breakpoint_mysql(UPDATE_MYSQL, "up", already * slicesize);
+        if (rt == INTERNAL_ERROR)
+            return INTERNAL_ERROR;
+
         if (offset_begin == -1) { // 任务丢失
             LOG_ERROR("task lost:%s", m_upload_file);
             return INTERNAL_ERROR;
         } else if (offset_begin < -1) { // 等待其他client上传完成，没有剩余slice可以用于分配
             LOG_INFO("client(%d:%s) waiting: all slice assigned", m_sockfd, m_username);
-            m_res = "{\"already\":" + std::to_string(m_tp->GetRecvSize(m_upload_file))
-                + ", \"all\":" + std::to_string(m_tp->GetAllSize(m_upload_file))
+            m_res = "{\"already\":" + std::to_string(already)
+                + ", \"all\":" + std::to_string(all)
                 + "}";
             return FILE_REQUEST;
         } else { // 成功分配到slice，要求上传
-            int slicesize = m_tp->GetSliceSize();
             m_slice_assign = offset_begin / slicesize;
             m_res = "{\"slice\":" + std::to_string(m_slice_assign)
                 + ", \"need_offset_begin\":" + std::to_string(offset_begin)
                 + ", \"slice_size\":" + std::to_string(slicesize)
-                + ", \"already\":" + std::to_string(m_tp->GetRecvSize(m_upload_file))
-                + ", \"all\":" + std::to_string(m_tp->GetAllSize(m_upload_file))
+                + ", \"already\":" + std::to_string(already)
+                + ", \"all\":" + std::to_string(all)
                 + "}";
             return FILE_REQUEST;
         }
     }
 }
 
-http_conn::HTTP_CODE http_conn::insertfile_mysql(bool flg)
+http_conn::HTTP_CODE http_conn::insertfile_mysql(MYSQL_OP flg, const int all)
 {
-    char* sql_insert = (char*)malloc(sizeof(char) * 200);
-    if (flg) {
-        strcpy(sql_insert, "INSERT INTO files(name,ftype,fsize,content,refer) VALUES('");
+    char* sql_insert = (char*)malloc(sizeof(char) * SQL_CLAUS_LEN);
+    if (flg == INSERT_MYSQL) {
+        strcpy(sql_insert, "INSERT INTO files(name,ftype,fsize,content,refer,slice) VALUES('");
         strcat(sql_insert, m_upload_file);
         strcat(sql_insert, "', '");
         strcat(sql_insert, m_file_type);
         strcat(sql_insert, "', ");
         strcat(sql_insert, std::to_string(m_file_size).c_str());
-        strcat(sql_insert, "', '");
+        strcat(sql_insert, ", '");
         strcat(sql_insert, m_upload_file);
-        strcat(sql_insert, "', 1)");
+        strcat(sql_insert, "', 1, ");
+        strcat(sql_insert, std::to_string(all).c_str());
+        strcat(sql_insert, ")");
         LOG_INFO(sql_insert);
 
     } else {
@@ -1119,7 +1300,7 @@ http_conn::HTTP_CODE http_conn::insertfile_mysql(bool flg)
     int res = mysql_query(mysql, sql_insert);
     m_lock.unlock();
 
-    if (!res) {
+    if (res) {
         free(sql_insert);
         LOG_ERROR("INSERT files ERROR, res = %d:%s", res, mysql_error(mysql));
         return INTERNAL_ERROR;
@@ -1131,16 +1312,16 @@ http_conn::HTTP_CODE http_conn::insertfile_mysql(bool flg)
 
 http_conn::HTTP_CODE http_conn::userfile_mysql()
 {
-    char* sql_insert = (char*)malloc(sizeof(char) * 200);
+    char* sql_insert = (char*)malloc(sizeof(char) * SQL_CLAUS_LEN);
     strcpy(sql_insert, "INSERT INTO user_file(u_name,f_name,f_type,f_size,f_path,change_time) VALUE('");
     strcat(sql_insert, m_username);
     strcat(sql_insert, "', '");
     strcat(sql_insert, m_upload_file);
     strcat(sql_insert, "', '");
     strcat(sql_insert, m_file_type);
-    strcat(sql_insert, "', '");
+    strcat(sql_insert, "', ");
     strcat(sql_insert, std::to_string(m_file_size).c_str());
-    strcat(sql_insert, "', '");
+    strcat(sql_insert, ", '");
     strcat(sql_insert, m_savepath);
     strcat(sql_insert, "', '");
     time_t t = time(NULL);
@@ -1158,9 +1339,7 @@ http_conn::HTTP_CODE http_conn::userfile_mysql()
     int res = mysql_query(mysql, sql_insert);
     m_lock.unlock();
 
-    m_tp->RemoveSock(m_upload_file, m_sockfd);
-
-    if (!res) {
+    if (res) {
         LOG_ERROR("INSERT user_file ERROR, res = %d:%s", res, mysql_error(mysql));
         free(sql_insert);
         return INTERNAL_ERROR;
@@ -1170,13 +1349,95 @@ http_conn::HTTP_CODE http_conn::userfile_mysql()
     return FILE_REQUEST;
 }
 
-http_conn::HTTP_CODE http_conn::downloadsingle_request()
+http_conn::HTTP_CODE http_conn::downloadsingle_request(const char* name, const char* pth)
 {
+    int slice = 0;
+    char* p = strstr(m_string, "needslice=");
+    if (p) {
+        p += 10;
+        char* q = strpbrk(p, " \t\n\r");
+        if (q)
+            *q = '\0';
+        slice = atoi(p);
+        LOG_INFO("%d", slice);
+    }
+    char* sql_insert = (char*)malloc(sizeof(char) * SQL_CLAUS_LEN);
+    strcpy(sql_insert, "SELECT f_name,f_type,f_size FROM user_file WHERE u_name='");
+    strcat(sql_insert, name);
+    strcat(sql_insert, "' AND f_path='");
+    strcat(sql_insert, pth);
+    strcat(sql_insert, "'");
+    LOG_INFO(sql_insert);
+    if (mysql_query(mysql, sql_insert)) {
+        LOG_ERROR("SELECT error:%s\n", mysql_error(mysql));
+        free(sql_insert);
+        return INTERNAL_ERROR;
+    }
+    MYSQL_RES* result = mysql_store_result(mysql);
+    int num_fields = mysql_num_fields(result);
+    MYSQL_FIELD* fields = mysql_fetch_fields(result);
+    MYSQL_ROW row = mysql_fetch_row(result);
+    if (!row) {
+        LOG_ERROR("didn't find row u_name='%s' and f_path='%s'", name, pth);
+        free(sql_insert);
+        return NO_RESOURCE;
+    }
+    char uploadfile[40], file_type[10];
+    m_file_size = atoi(row[2]);
+    strcpy(uploadfile, row[0]);
+    strcpy(file_type, row[1]);
+    m_upload_file = uploadfile;
+    m_file_type = file_type;
+    LOG_INFO("m_upload_file=%s,m_file_type=%s,m_file_size=%d", m_upload_file, m_file_type, m_file_size);
+    strcpy(sql_insert, "SELECT content,slice FROM files WHERE name='");
+    strcat(sql_insert, row[0]);
+    strcat(sql_insert, "' AND ftype='");
+    strcat(sql_insert, row[1]);
+    strcat(sql_insert, "' AND fsize=");
+    strcat(sql_insert, row[2]);
+    LOG_INFO(sql_insert);
+    if (mysql_query(mysql, sql_insert)) {
+        LOG_ERROR("SELECT error:%s\n", mysql_error(mysql));
+        free(sql_insert);
+        return INTERNAL_ERROR;
+    }
+    result = mysql_store_result(mysql);
+    num_fields = mysql_num_fields(result);
+    fields = mysql_fetch_fields(result);
+    row = mysql_fetch_row(result);
+    if (!row) {
+        LOG_ERROR("didn't find row f_name='%s' and f_type='%s' and f_size='%s'", row[0], row[1], row[2]);
+        free(sql_insert);
+        return NO_RESOURCE;
+    }
+
+    if (slice == 1) {
+        breakpoint_mysql(INSERT_MYSQL, "down", slice);
+    } else if (slice > 1) {
+        breakpoint_mysql(UPDATE_MYSQL, "down", slice);
+    }
+
+    int all = 0;
+    if (row[1])
+        all = atoi(row[1]);
+    LOG_INFO("all=%d,slice=%d", all, slice);
+    if (slice >= all) {
+        m_res = "OK";
+        m_res_type = RES_MESSAGE;
+    } else {
+        strcpy(m_real_file, row[0]);
+        strcat(m_real_file, "/");
+        strcat(m_real_file, std::to_string(slice).c_str());
+        LOG_INFO("m_real_file:%s", m_real_file);
+        m_res_type = RES_FILE;
+    }
+    free(sql_insert);
+    return FILE_REQUEST;
 }
 
 http_conn::HTTP_CODE http_conn::getall_request(const char* name)
 {
-    char* sql_insert = (char*)malloc(sizeof(char) * 200);
+    char* sql_insert = (char*)malloc(sizeof(char) * SQL_CLAUS_LEN);
     strcpy(sql_insert, "SELECT f_type,f_path FROM user_file WHERE u_name='");
     strcat(sql_insert, name);
     strcat(sql_insert, "'");
@@ -1195,11 +1456,15 @@ http_conn::HTTP_CODE http_conn::getall_request(const char* name)
 
     ofstream rowfs(m_real_file, ios::out);
     rowfs << "[";
+    char* p = (char*)malloc(sizeof(char) * 500);
     while (MYSQL_ROW row = mysql_fetch_row(result)) {
 
         rowfs << "{\"f_type\":\"" << row[0] << "\",";
-        rowfs << "\"f_path\":\"" << row[1] << "\"},";
+        int len = strlen(row[1]);
+        GbkToUtf8(row[1], len, p, 500);
+        rowfs << "\"f_path\":\"" << p << "\"},";
     }
+    free(p);
     rowfs << "]";
     rowfs.close();
 
@@ -1207,9 +1472,161 @@ http_conn::HTTP_CODE http_conn::getall_request(const char* name)
     return FILE_REQUEST;
 }
 
-bool http_conn::file_exist()
+http_conn::HTTP_CODE http_conn::breakpoint_mysql(MYSQL_OP flg, const char* op, const int already)
+{
+    LOG_INFO("before this malloc brk");
+    char* brk_insert = (char*)malloc(sizeof(char) * SQL_CLAUS_LEN);
+    LOG_INFO("after this free brk");
+    if (flg == INSERT_MYSQL) {
+        strcpy(brk_insert, "INSERT INTO file_breakpoint(u_name,f_name,f_size,f_type,op,breakpoint,f_path) VALUES('");
+        strcat(brk_insert, m_username);
+        strcat(brk_insert, "', '");
+        strcat(brk_insert, m_upload_file);
+        strcat(brk_insert, "', ");
+        strcat(brk_insert, std::to_string(m_file_size).c_str());
+        strcat(brk_insert, ", '");
+        strcat(brk_insert, m_file_type);
+        strcat(brk_insert, "', '");
+        strcat(brk_insert, op);
+        strcat(brk_insert, "', ");
+        strcat(brk_insert, std::to_string(already).c_str());
+        strcat(brk_insert, ", '");
+        strcat(brk_insert, m_savepath);
+        strcat(brk_insert, "') ON DUPLICATE KEY UPDATE breakpoint=");
+        strcat(brk_insert, std::to_string(already).c_str());
+    } else if (flg == UPDATE_MYSQL) {
+        strcpy(brk_insert, "UPDATE file_breakpoint SET breakpoint=");
+        strcat(brk_insert, std::to_string(already).c_str());
+        strcat(brk_insert, " WHERE u_name='");
+        strcat(brk_insert, m_username);
+        strcat(brk_insert, "' AND f_path='");
+        strcat(brk_insert, m_savepath);
+        strcat(brk_insert, "'");
+    } else { // DELETE
+        strcpy(brk_insert, "DELETE FROM file_breakpoint WHERE u_name='");
+        strcat(brk_insert, m_username);
+        strcat(brk_insert, "' AND f_path='");
+        strcat(brk_insert, m_savepath);
+        strcat(brk_insert, "'");
+    }
+    LOG_INFO(brk_insert);
+
+    m_lock.lock();
+    int res = mysql_query(mysql, brk_insert);
+    m_lock.unlock();
+
+    if (res) {
+        LOG_ERROR("modify file_breakpoint error, res = %d:%s", res, mysql_error(mysql));
+        free(brk_insert);
+        return INTERNAL_ERROR;
+    }
+    // m_res在外面已经填写过了
+    free(brk_insert);
+    return FILE_REQUEST;
+}
+
+http_conn::HTTP_CODE http_conn::downloaddir_request(const char* name, const char* dirpath)
+{
+    m_res_type = RES_FILE;
+    char* sql_insert = (char*)malloc(sizeof(char) * SQL_CLAUS_LEN);
+    strcpy(sql_insert, "SELECT f_path FROM user_file WHERE u_name='");
+    strcat(sql_insert, name);
+    strcat(sql_insert, "' AND f_path REGEXP '");
+    strcat(sql_insert, dirpath);
+    strcat(sql_insert, "/.*' AND f_type='dir'");
+    LOG_INFO(sql_insert);
+    if (mysql_query(mysql, sql_insert)) {
+        LOG_ERROR("SELECT error:%s\n", mysql_error(mysql));
+        free(sql_insert);
+        return INTERNAL_ERROR;
+    }
+    MYSQL_RES* result = mysql_store_result(mysql);
+    int num_fields = mysql_num_fields(result);
+    MYSQL_FIELD* fields = mysql_fetch_fields(result);
+    strcpy(m_real_file, name);
+    strcat(m_real_file, ".filelst");
+    LOG_INFO("create file:%s\n", m_real_file);
+    ofstream rowfs(m_real_file, ios::out);
+    rowfs << "[";
+    char* p = (char*)malloc(sizeof(char) * 500);
+    while (MYSQL_ROW row = mysql_fetch_row(result)) {
+        int len = strlen(row[0]);
+        GbkToUtf8(row[0], len, p, 500);
+        rowfs << "{\"dir\":\"" << p << "\"},\n";
+    }
+    rowfs << "],\n";
+
+    strcpy(sql_insert, "SELECT f_path FROM user_file WHERE u_name='");
+    strcat(sql_insert, name);
+    strcat(sql_insert, "' AND f_path REGEXP '");
+    strcat(sql_insert, dirpath);
+    strcat(sql_insert, "/.*' AND f_type<>'dir'");
+    LOG_INFO(sql_insert);
+    if (mysql_query(mysql, sql_insert)) {
+        LOG_ERROR("SELECT error:%s\n", mysql_error(mysql));
+        free(sql_insert);
+        return INTERNAL_ERROR;
+    }
+    result = mysql_store_result(mysql);
+    num_fields = mysql_num_fields(result);
+    fields = mysql_fetch_fields(result);
+    rowfs << "[";
+    while (MYSQL_ROW row = mysql_fetch_row(result)) {
+        int len = strlen(row[0]);
+        GbkToUtf8(row[0], len, p, 500);
+        rowfs << "{\"file\":\"" << p << "\"},\n";
+    }
+    free(p);
+    rowfs << "]";
+    rowfs.close();
+    free(sql_insert);
+    return FILE_REQUEST;
+}
+
+http_conn::HTTP_CODE http_conn::delbreakpoint_request(const char* name, const char* pth)
 {
     char* sql_insert = (char*)malloc(sizeof(char) * 200);
+    strcpy(sql_insert, "SELECT f_name FROM file_breakpoint WHERE u_name='");
+    strcat(sql_insert, name);
+    strcat(sql_insert, "' AND f_path='");
+    strcat(sql_insert, pth);
+    strcat(sql_insert, "'");
+    LOG_INFO(sql_insert);
+    if (mysql_query(mysql, sql_insert)) {
+        LOG_ERROR("SELECT error:%s\n", mysql_error(mysql));
+        free(sql_insert);
+        return INTERNAL_ERROR;
+    }
+    MYSQL_RES* result = mysql_store_result(mysql);
+    int num_fields = mysql_num_fields(result);
+    MYSQL_FIELD* fields = mysql_fetch_fields(result);
+    MYSQL_ROW row = mysql_fetch_row(result);
+    system(("rm -rf " + std::string(row[0])).c_str());
+
+    strcpy(sql_insert, "DELETE FROM file_breakpoint WHERE u_name='");
+    strcat(sql_insert, name);
+    strcat(sql_insert, "' AND f_path='");
+    strcat(sql_insert, pth);
+    strcat(sql_insert, "'");
+    LOG_INFO(sql_insert);
+
+    m_lock.lock();
+    int res = mysql_query(mysql, sql_insert);
+    m_lock.unlock();
+
+    if (res) {
+        LOG_ERROR("DELETE file_breakpoint ERROR, res = %d:%s", res, mysql_errno(mysql));
+        free(sql_insert);
+        return INTERNAL_ERROR;
+    } else
+        m_res = "0";
+    free(sql_insert);
+    return FILE_REQUEST;
+}
+
+bool http_conn::file_exist()
+{
+    char* sql_insert = (char*)malloc(sizeof(char) * SQL_CLAUS_LEN);
     strcpy(sql_insert, "SELECT content FROM files WHERE name='");
     strcat(sql_insert, m_upload_file);
     strcat(sql_insert, "' AND ftype='");
@@ -1234,20 +1651,45 @@ bool http_conn::file_exist()
 }
 bool http_conn::save_file()
 {
-    printf("in savefile\n");
-    printf("%s\nsize:%d\n", m_string, strlen(m_string));
+    LOG_INFO("in savefile()");
+    ++m_string;
+    // LOG_INFO("m_string:(%d)%p,m_boundary:%s", strlen(m_string), m_string, m_boundary);
+    LOG_INFO("%s", m_string);
+    char* content_end = strstr(m_string, m_boundary);
+    for (content_end - 1; content_end && *content_end == '-'; --content_end)
+        ;
+    content_end--;
+    LOG_INFO("ced:%p", content_end);
+    // LOG_INFO("alive here");
+    //  接收到片段，避免其他再写入
+    m_tp->RecvTask(m_upload_file, m_slice_id);
     //判断文件夹是否存在
     if (access(m_upload_file, F_OK) == -1) {
         mkdir(m_upload_file, S_IRWXU);
     }
-    FILE* fd = fopen((std::string(m_upload_file) + "/" + std::to_string(m_slice_id)).c_str(), "a");
+    int ori_len = m_content_length;
+    // int new_len = ori_len + ori_len / 2 + 1;
+    // char* p = (char*)malloc(sizeof(char) * new_len);
+
+    // LOG_INFO("alive there");
+    // int sz = GbkToUtf8(m_string, ori_len, p, new_len);
+    // LOG_INFO("changed back to utf8");
+    FILE* fd = fopen((std::string(m_upload_file) + "/" + std::to_string(m_slice_id)).c_str(), "w");
     if (!fd) {
         LOG_ERROR("open file ERROR:No.%d,%s", errno, strerror(errno));
         return false;
     }
-    int rt = fwrite(m_string, m_content_length, 1, fd);
+    LOG_INFO("content_length:%d,boundary_len:%d", m_content_length, strlen(m_boundary));
+    LOG_INFO("%s", m_boundary);
+    int sz = m_content_length - strlen(m_boundary) - 4;
+    if (content_end > m_string)
+        sz = int(content_end - m_string);
+    // int rt = fwrite(m_string, m_content_length, 1, fd);
+    int rt = fwrite(m_string, sz, 1, fd);
+    // int rt = fwrite(p, sz, 1, fd);
     fclose(fd);
-    LOG_INFO("write %d bytes of file %s", rt, m_upload_file);
+    // free(p);
+    LOG_INFO("write %d bytes, slice %d of file %s", m_content_length, m_slice_id, m_upload_file);
     return true;
 }
 void http_conn::unmap()

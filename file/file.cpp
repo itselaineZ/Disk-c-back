@@ -12,6 +12,7 @@ FILEUTIL::~FILEUTIL()
 
 bool FILEUTIL::MergeFile(const char* name, const int num)
 {
+    printf("in merge file\n");
     DIR* dir;
     struct dirent* ptr;
     int count = 0;
@@ -27,23 +28,27 @@ bool FILEUTIL::MergeFile(const char* name, const int num)
     closedir(dir);
     if (num != count)
         return false;
-    for (int i = 0; i < count; ++ i)
-        AppendFile(std::to_string(i).c_str(), name);
-    return true;
+    bool rt = true;
+    for (int i = 0; i < count; ++i)
+        rt &= AppendFile(std::to_string(i).c_str(), name);
+    return rt;
 }
 
 //把src文件拼接在aim文件后
 bool FILEUTIL::AppendFile(const char* src, const char* aim)
 {
-    FILE* aimfd = fopen(aim, "a");
-    FILE* srcfd = fopen(src, "r");
+    string srcpath = std::string(aim) + "/" + std::string(src);
+    string aimpath = std::string(aim) + "/" + std::string(aim);
+    FILE* aimfd = fopen(aimpath.c_str(), "ab");
+    FILE* srcfd = fopen(srcpath.c_str(), "rb");
+    printf("aim:%p src:%p\n", aimfd, srcfd);
     if (!aimfd || !srcfd)
         return false;
 
-    int res = 0;
-    do {
-        res = fread(buf, PIECE_LEN, 1, srcfd);
-        fwrite(buf, res, 1, aimfd);
-    } while (res == PIECE_LEN);
+    int res = fread(buf, PIECE_LEN, 1, srcfd);
+    printf("read:%d\n", res);
+    fwrite(buf, res, 1, aimfd);
+    fclose(aimfd);
+    fclose(srcfd);
     return true;
 }

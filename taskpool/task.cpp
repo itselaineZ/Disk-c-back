@@ -1,16 +1,14 @@
 #include "task.h"
 
 taskque::taskque() { }
-taskque::taskque(int t_size, string type, string name, bool init)
+taskque::taskque(int t_size, string type, string name)
 {
     m_size = t_size;
     m_type = type;
     m_name = name;
     m_count = t_size / SLICE_SIZE + (t_size / SLICE_SIZE * SLICE_SIZE < t_size);
-    if (init) {
-        for (int i = 0; i < m_count; ++i)
-            m_q.push(i);
-    }
+    for (int i = 0; i < m_count; ++i)
+        m_assign.push(i);
 }
 taskque::~taskque() { }
 
@@ -19,10 +17,14 @@ int taskque::GetSlice()
 {
     int rt = -1;
     lck.lock();
-    if (!m_q.empty()) {
-        rt = m_q.front();
-        m_q.pop();
+    while (!m_assign.empty()) {
+        rt = m_assign.front();
+        m_assign.pop();
+        // 查找一片还没有接收到的片段分配出去
+        if (m_rec.find(rt) == m_rec.end())
+            break;
     }
+    m_assign.push(rt);
     lck.unlock();
     return rt * SLICE_SIZE;
 }
@@ -30,13 +32,14 @@ int taskque::GetSlice()
 TASK_STATUS taskque::RecvTask(int slice)
 {
     lck.lock();
-    m_q.push(slice);
+    m_rec.insert(slice);
     lck.unlock();
-    if (m_q.size() == m_count) {
-        FILEUTIL fu;
-        bool rt = fu.MergeFile(m_name.c_str(), m_count);
-        if (!rt)
-            return MERGE_FAILED;
+    if (m_rec.size() == m_count) {
+        printf("to merge\n");
+        // FILEUTIL fu;
+        // bool rt = fu.MergeFile(m_name.c_str(), m_count);
+        // if (!rt)
+        //     return MERGE_FAILED;
         return MERGE_SUCCESS;
     }
     return RECVING;
@@ -44,7 +47,7 @@ TASK_STATUS taskque::RecvTask(int slice)
 
 int taskque::GetRecvSize()
 {
-    return m_q.size();
+    return m_rec.size();
 }
 
 int taskque::GetAllSize()
@@ -57,33 +60,7 @@ int taskque::GetSliceSize()
     return SLICE_SIZE;
 }
 
-void taskque::AddSlice(int slice)
+bool taskque::FindSlice(int slice)
 {
-    lck.lock();
-    m_q.push(slice);
-    lck.unlock();
-}
-
-cliset::cliset() { }
-cliset::~cliset() { }
-
-void cliset::AddSock(int sock)
-{
-    lck.lock();
-    m_st.insert(sock);
-    lck.unlock();
-}
-
-bool cliset::FindSock(int sock)
-{
-    return m_st.find(sock) != m_st.end();
-}
-
-// 删除后set为空返回1，不为空则返回0
-bool cliset::DelSock(int sock)
-{
-    lck.lock();
-    m_st.erase(sock);
-    lck.unlock();
-    return m_st.size() == 0;
+    return m_rec.find(slice) != m_rec.end();
 }

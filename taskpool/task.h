@@ -17,16 +17,15 @@ enum TASK_STATUS {
 
 class taskque {
 public:
-    static const int SLICE_SIZE = 512; // 1KBÿƬ
+    static const int SLICE_SIZE = 1024*1024; // 2MBÿƬ
     taskque();
-    taskque(int t_size, string type, string name, bool init);
+    taskque(int t_size, string type, string name);
     ~taskque();
     int GetSlice();
     TASK_STATUS RecvTask(int slice);
     int GetRecvSize();
     int GetAllSize();
     static int GetSliceSize();
-    void AddSlice(int slice);
     bool FindSlice(int slice);
 
 public:
@@ -37,20 +36,8 @@ private:
     locker lck;
     string m_name;
     int m_count;
-    queue<int> m_q;
-};
-
-class cliset {
-public:
-    cliset();
-    ~cliset();
-    void AddSock(int sock);
-    bool FindSock(int sock);
-    bool DelSock(int sock);
-
-private:
-    locker lck;
-    set<int> m_st;
+    queue<int> m_assign;
+    set<int> m_rec;
 };
 
 #endif

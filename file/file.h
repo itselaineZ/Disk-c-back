@@ -10,7 +10,7 @@ using namespace std;
 
 class FILEUTIL {
 public:
-    static const int PIECE_LEN = 1024;
+    static const int PIECE_LEN = 1024*1024;
     FILEUTIL();
     ~FILEUTIL();
     bool MergeFile(const char* name, const int num);

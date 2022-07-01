@@ -29,7 +29,7 @@ Server::~Server()
 }
 
 void Server::init(int port, string user, string passWord, string dbName,
-    int log_write, int sql_num, int close_log, int actormodel, 
+    int log_write, int sql_num, int close_log, int actormodel,
     int thread_num, int file_thread_num)
 {
     m_port = port;
@@ -159,11 +159,11 @@ void Server::eventLoop()
                 bool flag = dealclinetdata();
                 if (false == flag)
                     continue;
-            } //else if (events[i].events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)) {
-            //     //服务器端关闭连接，移除对应的定时器
-            //     util_timer* timer = users_timer[sockfd].timer;
-            //     deal_timer(timer, sockfd);
-            // }
+            } else if (events[i].events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)) {
+                //服务器端关闭连接，移除对应的定时器
+                util_timer* timer = users_timer[sockfd].timer;
+                deal_timer(timer, sockfd);
+            }
             //处理信号（另一个进程发来的信息）
             else if ((sockfd == m_pipefd[0]) && (events[i].events & EPOLLIN)) {
                 bool flag = dealwithsignal(timeout, stop_server);
@@ -195,7 +195,7 @@ void Server::timer(int connfd, struct sockaddr_in client_address)
     //创建定时器，设置回调函数和超时时间，绑定用户数据，将定时器添加到链表中
     users_timer[connfd].address = client_address;
     users_timer[connfd].sockfd = connfd;
-    //users_timer[connfd].p_user = users + connfd;
+    // users_timer[connfd].p_user = users + connfd;
     util_timer* timer = new util_timer;
     timer->user_data = &users_timer[connfd];
     timer->cb_func = cb_func; //删除user的函数
@@ -232,19 +232,33 @@ bool Server::dealclinetdata()
 {
     struct sockaddr_in client_address;
     socklen_t client_addrlength = sizeof(client_address);
-    int connfd = accept(m_listenfd, (struct sockaddr*)&client_address, &client_addrlength);
-    if (connfd < 0) {
-        LOG_ERROR("%s:errno is:%d", "accept error", errno);
-        return false;
-    }
-    if (http_conn::m_user_count >= MAX_FD) {
-        utils.show_error(connfd, "Internal server busy");
-        LOG_ERROR("%s", "Internal server busy");
-        return false;
-    }
-    timer(connfd, client_address);
+    // int connfd = accept(m_listenfd, (struct sockaddr*)&client_address, &client_addrlength);
+    // if (connfd < 0) {
+    //     LOG_ERROR("%s:errno is:%d", "accept error", errno);
+    //     return false;
+    // }
+    // if (http_conn::m_user_count >= MAX_FD) {
+    //     utils.show_error(connfd, "Internal server busy");
+    //     LOG_ERROR("%s", "Internal server busy");
+    //     return false;
+    // }
+    // timer(connfd, client_address);
 
-    return true;
+    // return true;
+    while (1) {
+        int connfd = accept(m_listenfd, (struct sockaddr*)&client_address, &client_addrlength);
+        if (connfd < 0) {
+            LOG_ERROR("%s:errno is:%d", "accept error", errno);
+            break;
+        }
+        if (http_conn::m_user_count >= MAX_FD) {
+            utils.show_error(connfd, "Internal server busy");
+            LOG_ERROR("%s", "Internal server busy");
+            break;
+        }
+        timer(connfd, client_address);
+    }
+    return false;
 }
 
 bool Server::dealwithsignal(bool& timeout, bool& stop_server)
@@ -299,12 +313,15 @@ void Server::dealwithread(int sockfd)
         }
     } else {
         // proactor
+        LOG_INFO("sockfd:%d", sockfd);
         if (users[sockfd].read_once()) {
             LOG_INFO("deal with the client(%s)", inet_ntoa(users[sockfd].get_address()->sin_addr));
-
-            //若监测到读事件，将该事件放入请求队列
-            m_pool->append_p(users + sockfd);
-
+            if (users[sockfd].m_inpool == false) {
+                users[sockfd].m_inpool = true;
+                //若监测到读事件，将该事件放入请求队列
+                LOG_INFO("put into pool");
+                m_pool->append_p(users + sockfd);
+            }
             if (timer) {
                 adjust_timer(timer);
             }
@@ -339,7 +356,8 @@ void Server::dealwithwrite(int sockfd)
         // proactor
         if (users[sockfd].write()) {
             LOG_INFO("send data to the client(%s)", inet_ntoa(users[sockfd].get_address()->sin_addr));
-
+            users[sockfd].m_inpool = false;
+            LOG_INFO("move out of pool");
             if (timer) {
                 adjust_timer(timer);
             }

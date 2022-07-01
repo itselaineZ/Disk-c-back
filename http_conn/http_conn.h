@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <string>
+#include <iconv.h>
 #include <sys/epoll.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -31,9 +32,10 @@
 class http_conn {
 public:
     static const int FILENAME_LEN = 200;
-    static const int READ_BUFFER_SIZE = 2048;
+    static const int READ_BUFFER_SIZE = 1024 * 1024 + 2048;
     static const int WRITE_BUFFER_SIZE = 1024;
     static const int AUTHORIZATION_LEN = 100;
+    static const int SQL_CLAUS_LEN = 1024;
     enum METHOD {
         GET = 0,
         POST,
@@ -69,7 +71,7 @@ public:
         RES_MESSAGE = 0,
         RES_FILE
     };
-    enum MYSQL_OP{
+    enum MYSQL_OP {
         INSERT_MYSQL = 0,
         UPDATE_MYSQL,
         DELETE_MYSQL
@@ -114,11 +116,13 @@ private:
     HTTP_CODE copyfile_request(const char* name, const char* oldpath, const char* newpath);
     HTTP_CODE delfile_request(const char* name, const char* pth);
     HTTP_CODE uploadsingle_request();
-    HTTP_CODE insertfile_mysql(bool flg);
+    HTTP_CODE insertfile_mysql(MYSQL_OP flg, const int all = 0);
     HTTP_CODE userfile_mysql();
-    HTTP_CODE downloadsingle_request();
-    HTTP_CODE breakpoint_mysql(int flg);
+    HTTP_CODE downloadsingle_request(const char* name, const char* pth);
+    HTTP_CODE breakpoint_mysql(MYSQL_OP flg, const char* op, const int already);
     HTTP_CODE getall_request(const char* name);
+    HTTP_CODE downloaddir_request(const char* name, const char* dirpath);
+    HTTP_CODE delbreakpoint_request(const char* name, const char* pth);
     char* get_line() { return m_read_buf + m_start_line; };
     LINE_STATUS parse_line();
     bool file_exist();
@@ -141,11 +145,12 @@ public:
     MYSQL* mysql;
     TASKPOOL* m_tp;
     int m_state; //读为0, 写为1
+    bool m_inpool;
 
 private:
     int m_sockfd;
     sockaddr_in m_address;
-    char m_read_buf[READ_BUFFER_SIZE];
+    char* m_read_buf;
     int m_read_idx;
     int m_checked_idx;
     int m_start_line;
@@ -165,6 +170,7 @@ private:
     char* m_savepath; // 只在上传下载的时候有效
     char* m_file_type;
     int m_file_size;
+    char* m_boundary;
     bool m_linger; // Keep-alive
     char* m_file_address;
     struct stat m_file_stat;
@@ -178,7 +184,7 @@ private:
     string m_res;
     char m_auth[AUTHORIZATION_LEN];
     bool m_with_auth;
-    bool m_res_type;
+    RESPONSE_DATA_TYPE m_res_type;
     int m_slice_assign; // 分配下去需要发回给服务器的数据id
 
     map<string, string> m_users;
